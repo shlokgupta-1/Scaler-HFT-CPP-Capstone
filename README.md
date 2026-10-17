@@ -129,11 +129,11 @@ All three implementations share the same external interface so the benchmark can
 |--------|--------|
 | Level storage | `std::map<int, long>` (tick → aggregate qty), one per side |
 | Order storage | `std::unordered_map<uint64_t, Order>` |
-| Best bid | `bids_.rbegin()` — O(log N) tree traversal |
-| Best ask | `asks_.begin()` — O(log N) tree traversal |
+| Best bid | `bids_.rbegin()` — **O(1)** (std::map maintains begin/end in O(1)) |
+| Best ask | `asks_.begin()` — **O(1)** (std::map maintains begin/end in O(1)) |
 | Find order for cancel | `orders_.find(id)` — O(1) average |
 
-The red-black tree keeps price levels sorted automatically. Its main cost is pointer-chasing (poor cache locality) and O(log N) insertion/deletion.
+The red-black tree keeps price levels sorted automatically. Its main cost is pointer-chasing (poor cache locality) and O(log N) insertion/deletion. Iterator access to begin/rbegin is O(1) — the tree keeps a pointer to the min and max nodes.
 
 ---
 
@@ -171,7 +171,7 @@ The level array is ~80 KB and fits comfortably in L2 cache. All level updates ar
 |-----------|--------|--------|--------|
 | `add_order` | O(log N) | O(log N) search + O(N) shift | **O(1)** |
 | `cancel_order` | O(log N) | O(log N) search + O(N) shift | **O(1) amort.** |
-| `get_bbo` | O(log N) | **O(1)** | **O(1)** |
+| `get_bbo` | **O(1)** | **O(1)** | **O(1)** |
 | `get_bids(D)` | O(D) | O(D) | O(D) |
 | `get_asks(D)` | O(D) | O(D) | O(D) |
 
@@ -182,20 +182,43 @@ D = requested depth
 
 ## Correctness Results
 
+The `--verify` mode runs two test stages:
+
+**Stage 1 — Unit tests (10 groups, 56 assertions)**
+
+| # | Test | Scenario |
+|---|------|----------|
+| 1 | Empty book | `get_bbo`, `get_bids`, `get_asks` on empty book — no crash, correct flags |
+| 2 | Cancel unknown | `cancel_order(999)` never added → `false` |
+| 3 | Cancel already-cancelled | cancel twice → first `true`, second `false` |
+| 4 | Aggregate qty at same price | two orders at 99.50 → qty sums; cancelling one reduces aggregate |
+| 5 | BBO updates — bid | cancel best bid → BBO falls to next level |
+| 6 | BBO updates — ask | cancel best ask → BBO rises to next level |
+| 7 | Price-band boundaries | orders at 50.00, 99.99, 100.01, 150.00 — all correctly handled |
+| 8 | Insufficient depth | 3 levels exist, `get_bids(10)` returns exactly 3 |
+| 9 | BBO with multi levels each side | correct best is selected from both sides |
+| 10 | Cancel mid-book level | BBO unchanged after non-best level is removed |
+
+**Stage 2 — Differential test: 200 000 ops, seed=42**  
+All three implementations replay the same workload and are compared at every BBO query, every depth query, and every cancellation.
+
 ```
 Running correctness test...
+
+--- Unit tests ---
+Unit tests: 56/56 passed
+
+--- Differential test (200 000 ops, seed=42) ---
 
 Implementation A: PASS
 Implementation B: PASS
 Implementation C: PASS
 
 All implementations produce identical results.
+Exit code: 0
 ```
 
-Checksums across all three implementations are identical: **491457988**  
-Final BBO (all three agree): `Bid: 99.99 x 2722 | Ask: 100.01 x 2525`
-
-*(Reproduced by running `./bench --verify` — 50 000 ops, seed=42)*
+`./bench --verify` exits with code **0** on success and **1** on any failure (CI-safe).
 
 ---
 

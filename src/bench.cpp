@@ -194,7 +194,7 @@ BenchResult run_bench(const std::vector<OpRecord>& ops) {
 }
 
 // ---------------------------------------------------------------------------
-// Correctness verification
+// String helpers (used by both unit tests and differential test)
 // ---------------------------------------------------------------------------
 
 static std::string level_vec_to_string(const std::vector<Level>& v) {
@@ -215,12 +215,217 @@ static std::string bbo_to_string(const BBO& b) {
     return ss.str();
 }
 
-static void run_verify() {
-    std::cout << "Running correctness test...\n\n";
+// ---------------------------------------------------------------------------
+// Unit test helpers
+// ---------------------------------------------------------------------------
 
-    const int    VERIFY_OPS  = 50'000;
-    const uint32_t SEED      = 42;
-    auto ops = build_workload(VERIFY_OPS, SEED);
+static int g_tests_run    = 0;
+static int g_tests_failed = 0;
+
+#define EXPECT(cond, msg) do { \
+    ++g_tests_run; \
+    if (!(cond)) { \
+        std::cerr << "  FAIL [" << __LINE__ << "]: " << (msg) << "\n"; \
+        ++g_tests_failed; \
+    } \
+} while(0)
+
+// Run the same named unit test against all three books
+template<typename BookA, typename BookB, typename BookC>
+struct TripleBook { BookA a; BookB b; BookC c; };
+
+// Helper: apply add to all three
+template<typename A, typename B, typename C>
+static void tri_add(TripleBook<A,B,C>& tb, uint64_t id, Side side, double price, long qty) {
+    tb.a.add_order(id, side, price, qty);
+    tb.b.add_order(id, side, price, qty);
+    tb.c.add_order(id, side, price, qty);
+}
+
+template<typename A, typename B, typename C>
+static void tri_cancel(TripleBook<A,B,C>& tb, uint64_t id, bool expected, const char* ctx) {
+    bool rA = tb.a.cancel_order(id);
+    bool rB = tb.b.cancel_order(id);
+    bool rC = tb.c.cancel_order(id);
+    ++g_tests_run;
+    if (rA != expected || rB != expected || rC != expected) {
+        std::cerr << "  FAIL cancel(" << id << ") ctx=" << ctx
+                  << " expected=" << expected
+                  << " A=" << rA << " B=" << rB << " C=" << rC << "\n";
+        ++g_tests_failed;
+    }
+}
+
+template<typename A, typename B, typename C>
+static void tri_expect_bbo(TripleBook<A,B,C>& tb,
+                            bool expHasBid, double expBidP, long expBidQ,
+                            bool expHasAsk, double expAskP, long expAskQ,
+                            const char* ctx) {
+    BBO bA = tb.a.get_bbo();
+    BBO bB = tb.b.get_bbo();
+    BBO bC = tb.c.get_bbo();
+    auto check = [&](const BBO& bbo, const char* impl) {
+        ++g_tests_run;
+        bool ok = true;
+        if (bbo.has_bid != expHasBid) ok = false;
+        if (expHasBid && std::abs(bbo.bid_price - expBidP) > 0.001) ok = false;
+        if (expHasBid && bbo.bid_qty != expBidQ) ok = false;
+        if (bbo.has_ask != expHasAsk) ok = false;
+        if (expHasAsk && std::abs(bbo.ask_price - expAskP) > 0.001) ok = false;
+        if (expHasAsk && bbo.ask_qty != expAskQ) ok = false;
+        if (!ok) {
+            std::cerr << "  FAIL BBO ctx=" << ctx << " impl=" << impl << "\n"
+                      << "    expected has_bid=" << expHasBid << " price=" << expBidP
+                      << " qty=" << expBidQ << "\n"
+                      << "    got      has_bid=" << bbo.has_bid << " price=" << bbo.bid_price
+                      << " qty=" << bbo.bid_qty << "\n"
+                      << "    expected has_ask=" << expHasAsk << " price=" << expAskP
+                      << " qty=" << expAskQ << "\n"
+                      << "    got      has_ask=" << bbo.has_ask << " price=" << bbo.ask_price
+                      << " qty=" << bbo.ask_qty << "\n";
+            ++g_tests_failed;
+        }
+    };
+    check(bA, "A"); check(bB, "B"); check(bC, "C");
+}
+
+// ---------------------------------------------------------------------------
+// run_unit_tests — deterministic edge cases
+// ---------------------------------------------------------------------------
+
+static void run_unit_tests() {
+    std::cout << "--- Unit tests ---\n";
+
+    // ---- 1. Empty book -------------------------------------------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_expect_bbo(tb, false,0,0, false,0,0, "empty book");
+
+        // get_bids / get_asks on empty book must return empty vectors, not crash
+        EXPECT(tb.a.get_bids(10).empty(), "A: get_bids empty book");
+        EXPECT(tb.b.get_bids(10).empty(), "B: get_bids empty book");
+        EXPECT(tb.c.get_bids(10).empty(), "C: get_bids empty book");
+        EXPECT(tb.a.get_asks(10).empty(), "A: get_asks empty book");
+        EXPECT(tb.b.get_asks(10).empty(), "B: get_asks empty book");
+        EXPECT(tb.c.get_asks(10).empty(), "C: get_asks empty book");
+    }
+
+    // ---- 2. Cancel unknown order (never inserted) ----------------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_cancel(tb, 999, false, "cancel unknown id");
+    }
+
+    // ---- 3. Cancel already-cancelled order -----------------------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy, 99.00, 10);
+        tri_cancel(tb, 1, true,  "first cancel succeeds");
+        tri_cancel(tb, 1, false, "second cancel (already gone) fails");
+    }
+
+    // ---- 4. Multiple orders at the same price: aggregate qty -----------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy, 99.50, 30);
+        tri_add(tb, 2, Side::Buy, 99.50, 70);
+        // Both at 99.50 → aggregate qty = 100
+        tri_expect_bbo(tb, true, 99.50, 100, false,0,0, "aggregate qty 100");
+
+        // Cancel one → aggregate qty = 70
+        tri_cancel(tb, 1, true, "cancel order 1");
+        tri_expect_bbo(tb, true, 99.50, 70, false,0,0, "aggregate qty 70 after cancel");
+
+        // Cancel second → book empty
+        tri_cancel(tb, 2, true, "cancel order 2");
+        tri_expect_bbo(tb, false,0,0, false,0,0, "empty after both cancelled");
+    }
+
+    // ---- 5. Best bid updates when top level is cancelled --------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy, 99.99, 10);
+        tri_add(tb, 2, Side::Buy, 99.98, 20);
+        tri_expect_bbo(tb, true, 99.99, 10, false,0,0, "best bid = 99.99");
+        tri_cancel(tb, 1, true, "cancel best bid");
+        tri_expect_bbo(tb, true, 99.98, 20, false,0,0, "best bid falls to 99.98");
+    }
+
+    // ---- 6. Best ask updates when top level is cancelled --------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Sell, 100.01, 10);
+        tri_add(tb, 2, Side::Sell, 100.02, 20);
+        tri_expect_bbo(tb, false,0,0, true, 100.01, 10, "best ask = 100.01");
+        tri_cancel(tb, 1, true, "cancel best ask");
+        tri_expect_bbo(tb, false,0,0, true, 100.02, 20, "best ask rises to 100.02");
+    }
+
+    // ---- 7. Price-band boundaries -------------------------------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy,  50.00,  1);   // min bid
+        tri_add(tb, 2, Side::Buy,  99.99,  2);   // max bid
+        tri_add(tb, 3, Side::Sell, 100.01, 3);   // min ask
+        tri_add(tb, 4, Side::Sell, 150.00, 4);   // max ask
+        tri_expect_bbo(tb, true, 99.99, 2, true, 100.01, 3, "boundary prices in BBO");
+
+        auto bidsA = tb.a.get_bids(5000);
+        EXPECT(bidsA.size() == 2, "A: 2 bid levels at boundaries");
+        EXPECT(std::abs(bidsA[0].price - 99.99) < 0.001, "A: top bid = 99.99");
+        EXPECT(std::abs(bidsA[1].price - 50.00) < 0.001, "A: second bid = 50.00");
+
+        auto asksA = tb.a.get_asks(5000);
+        EXPECT(asksA.size() == 2, "A: 2 ask levels at boundaries");
+        EXPECT(std::abs(asksA[0].price - 100.01) < 0.001, "A: top ask = 100.01");
+        EXPECT(std::abs(asksA[1].price - 150.00) < 0.001, "A: second ask = 150.00");
+    }
+
+    // ---- 8. Insufficient depth (returns only available levels) --------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy, 99.99, 10);
+        tri_add(tb, 2, Side::Buy, 99.98, 20);
+        tri_add(tb, 3, Side::Buy, 99.97, 30);
+        // Only 3 levels exist; requesting 10 must return exactly 3
+        EXPECT(tb.a.get_bids(10).size() == 3, "A: get_bids(10) returns 3 when only 3 exist");
+        EXPECT(tb.b.get_bids(10).size() == 3, "B: get_bids(10) returns 3 when only 3 exist");
+        EXPECT(tb.c.get_bids(10).size() == 3, "C: get_bids(10) returns 3 when only 3 exist");
+    }
+
+    // ---- 9. BBO correct when both sides have multiple levels ----------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy,  99.50, 50);
+        tri_add(tb, 2, Side::Buy,  99.75, 25);  // best bid
+        tri_add(tb, 3, Side::Sell, 100.25, 60);
+        tri_add(tb, 4, Side::Sell, 100.10, 15);  // best ask
+        tri_expect_bbo(tb, true, 99.75, 25, true, 100.10, 15, "bbo with multi levels each side");
+    }
+
+    // ---- 10. Cancel mid-book level, BBO unchanged ---------------------------
+    {
+        TripleBook<OrderBookA, OrderBookB, OrderBookC> tb;
+        tri_add(tb, 1, Side::Buy, 99.99, 10);
+        tri_add(tb, 2, Side::Buy, 99.90, 20);
+        tri_add(tb, 3, Side::Sell, 100.01, 5);
+        tri_cancel(tb, 2, true, "cancel non-best bid level");
+        // BBO should still be 99.99 / 100.01
+        tri_expect_bbo(tb, true, 99.99, 10, true, 100.01, 5, "bbo unchanged after mid-level cancel");
+    }
+
+    std::cout << "Unit tests: " << (g_tests_run - g_tests_failed)
+              << "/" << g_tests_run << " passed\n\n";
+}
+
+// ---------------------------------------------------------------------------
+// run_differential_test — 200k-op seeded cross-implementation comparison
+// ---------------------------------------------------------------------------
+
+static bool run_differential_test() {
+    const int    DIFF_OPS = 200'000;
+    const uint32_t SEED   = 42;
+    auto ops = build_workload(DIFF_OPS, SEED);
 
     OrderBookA bookA;
     OrderBookB bookB;
@@ -228,9 +433,6 @@ static void run_verify() {
 
     bool ok = true;
     int mismatch_count = 0;
-
-    // Track live IDs per-book (all three advance identically)
-    // We just play the same ops on all three and compare after every op.
 
     for (size_t i = 0; i < ops.size(); ++i) {
         const auto& op = ops[i];
@@ -246,10 +448,9 @@ static void run_verify() {
             bool rB = bookB.cancel_order(op.cancel_id);
             bool rC = bookC.cancel_order(op.cancel_id);
             if (rA != rB || rA != rC) {
-                std::cout << "MISMATCH at op " << i << " (cancel): "
+                std::cout << "  MISMATCH at op " << i << " (cancel): "
                           << "A=" << rA << " B=" << rB << " C=" << rC << "\n";
-                ++mismatch_count;
-                ok = false;
+                ++mismatch_count; ok = false;
             }
 
         } else {
@@ -264,11 +465,8 @@ static void run_verify() {
                 std::string sAB = level_vec_to_string(asksB);
                 std::string sAC = level_vec_to_string(asksC);
                 if (sBA != sBB || sBA != sBC || sAA != sAB || sAA != sAC) {
-                    std::cout << "MISMATCH at op " << i << " (depth):\n"
-                              << "  BidsA=" << sBA << "\n  BidsB=" << sBB << "\n  BidsC=" << sBC << "\n"
-                              << "  AsksA=" << sAA << "\n  AsksB=" << sAB << "\n  AsksC=" << sAC << "\n";
-                    ++mismatch_count;
-                    ok = false;
+                    std::cout << "  MISMATCH at op " << i << " (depth)\n";
+                    ++mismatch_count; ok = false;
                 }
             } else {
                 BBO bA = bookA.get_bbo();
@@ -278,29 +476,51 @@ static void run_verify() {
                 std::string sB = bbo_to_string(bB);
                 std::string sC = bbo_to_string(bC);
                 if (sA != sB || sA != sC) {
-                    std::cout << "MISMATCH at op " << i << " (bbo):\n"
-                              << "  A=" << sA << "\n  B=" << sB << "\n  C=" << sC << "\n";
-                    ++mismatch_count;
-                    ok = false;
+                    std::cout << "  MISMATCH at op " << i << " (bbo): "
+                              << "A=" << sA << " B=" << sB << " C=" << sC << "\n";
+                    ++mismatch_count; ok = false;
                 }
             }
         }
 
         if (mismatch_count >= 5) {
-            std::cout << "Too many mismatches; aborting verify.\n";
+            std::cout << "  Too many mismatches; aborting differential test.\n";
             break;
         }
     }
 
-    if (ok) {
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// run_verify — orchestrate unit + differential tests, exit(1) on failure
+// ---------------------------------------------------------------------------
+
+static void run_verify() {
+    std::cout << "Running correctness test...\n\n";
+
+    run_unit_tests();
+
+    std::cout << "--- Differential test (200 000 ops, seed=42) ---\n";
+    bool diff_ok = run_differential_test();
+
+    std::cout << "\n";
+    if (diff_ok) {
         std::cout << "Implementation A: PASS\n";
         std::cout << "Implementation B: PASS\n";
         std::cout << "Implementation C: PASS\n\n";
         std::cout << "All implementations produce identical results.\n";
     } else {
-        std::cout << "\nVerification FAILED with " << mismatch_count << " mismatches.\n";
+        std::cout << "Differential test: FAIL — implementations disagree.\n";
+    }
+
+    bool all_ok = (g_tests_failed == 0) && diff_ok;
+    if (!all_ok) {
+        std::cerr << "\nVerification FAILED.\n";
+        std::exit(1);   // nonzero exit code so CI / graders catch it
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Benchmark driver
