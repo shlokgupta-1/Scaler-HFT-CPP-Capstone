@@ -1,6 +1,6 @@
 # Low-Latency Order Book — Capstone
 
-**Student:** [Your Name] | **SST Roll Number:** [Your Roll Number]  
+**Student:** Shlok Gupta | **SST Roll Number:** 24BCS10322
 **Course:** Scaler HFT C++ 2028  
 **Deadline:** 17th October 2026, 11:59 PM  
 **Language:** C++17
